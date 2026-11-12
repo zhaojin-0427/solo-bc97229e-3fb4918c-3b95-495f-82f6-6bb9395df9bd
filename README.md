@@ -15,7 +15,7 @@
 | 保留六表字段、主外键定义及原值 | 直接复用 `sqlite_master` 中的原始 CREATE 语句与索引，按原列顺序、原值 INSERT |
 | 生成通过外键检查的 SQLite 文件 | 加载后执行 `PRAGMA foreign_key_check` + `integrity_check`，全过才原子改名 |
 | 客户推荐关系可成环 | 临时表 `seen` 去重使 BFS 自然收敛；加载期关外键以容纳循环外键，加载后统一校验 |
-| 抽取期间源库可继续增删改，整份切片来自**同一快照** | 每任务一个 `mode=ro` 只读连接，显式 `BEGIN` 后首条读语句固定 WAL 读标记，全程不关闭 |
+| 抽取期间源库可继续增删改，整份切片来自**同一快照** | 每任务一个 `mode=ro` 只读连接；临时表建好后显式 `BEGIN`，首条读语句固定 WAL 读标记，**该读事务一直保持到种子选取、闭包遍历、分批拷贝全部结束**；WAL 下读事务不阻塞写入，源库写入可在抽取结束前提交 |
 | 不能把全部选中 ID 或记录装入内存 | 遍历状态在 SQLite **磁盘临时表**（`temp_store=FILE`），Python 每批只取 `BATCH_SIZE` 行；拷贝按键集分页流式进行。实测 5 千→8 万行闭包，Python 峰值 0.10→0.12 MB |
 | 缺失引用或执行中断则整次失败，不提供残件 | 先写 `*.partial` 临时库，任何异常立即删除；只有全部检查通过才 `os.replace` 原子改名 |
 | 重启后成功状态与完整文件保持一致 | 启动恢复：在途任务重置 failed、清理残件；success 但文件丢失则降级 failed；孤儿文件清理 |
@@ -38,7 +38,7 @@ app/
 scripts/
   build_demo_db.py  示例库生成 CLI（--orphan 可造断引用）
   entrypoint.sh     容器入口（首启自动建示例库）
-tests/            24 个 pytest 用例
+tests/            26 个 pytest 用例
 Dockerfile, docker-compose.yml, requirements.txt, wsgi.py, run.py
 ```
 
@@ -98,9 +98,20 @@ SLICE_SOURCE_DB=/tmp/demo/source.db SLICE_DATA_DIR=/tmp/demo/data \
 ## 六、核心算法说明
 
 ### 1. 快照一致性
-每个任务独占一个 `file:...?mode=ro` 只读连接，`BEGIN` 后立即执行一条读语句，
-在 WAL 模式下该连接的读标记（read mark）就此固定；连接在整个遍历+拷贝期间保持
-打开，源库后续的提交对它不可见。任务结束才关闭连接。
+每个任务独占一个 `file:...?mode=ro` 只读连接。**先创建临时表，再 `BEGIN`
+并立即执行一条读语句**，在 WAL 模式下该连接的读标记（read mark）就此固定；
+这个读事务一直保持到种子选取、闭包遍历、分批拷贝全部结束，源库后续的提交
+对它不可见，整份切片来自抽取开始时的同一快照。WAL 下读事务不阻塞写入，
+源库写入可在抽取结束前正常提交（有回归测试断言）。
+
+> 关键陷阱（本次修复的快照缺陷）：`Connection.executescript()` 会先隐式
+> COMMIT 任何未决事务。旧代码在 `BEGIN` 之后用它创建临时表，快照读标记被
+> 立即释放，连接退回自动提交模式，此后每条 SELECT 各自看到不同时刻的提交：
+> 客户表拷贝于 T1、商品表拷贝于 T2，切片拼出“旧客户名 + 新价格”；遍历完成
+> 后源库合法改单（明细改指另一商品并删除旧商品）还会让拷贝读到新外键值，
+> 误报外键失败。修复：临时表改在 `BEGIN` 之前、且对快照连接只用 `execute`
+> 逐条创建（结构上杜绝隐式 COMMIT），并在遍历后、拷贝后断言读事务仍然打开，
+> 一旦意外被提交立即整次失败，绝不产出撕裂的切片。
 
 ### 2. 有界内存 BFS
 四个磁盘临时表承担全部遍历状态（`PRAGMA temp_store=FILE`，均为
@@ -130,12 +141,18 @@ pip install -r requirements.txt pytest
 python -m pytest tests/ -v
 ```
 
-24 个用例覆盖：
+26 个用例覆盖：
 
 - `test_closure.py`：闭包精确性、客户两环/自环、不反向带入兄弟退货单与未退货明细、
   结构/原值保留
 - `test_failure.py`：种子缺失、遍历中断引用、脏库、坏结构 → 整次失败且无残件
-- `test_snapshot.py`：抽取期间写入器并发增删改，切片仍等于快照时刻；重复抽取一致
+- `test_snapshot.py`：抽取期间写入器并发增删改，切片仍等于快照时刻；重复抽取一致；
+  **两个确定性交错回归测试**（`on_event` 钩子 + `threading.Event` 精确控制时序，
+  无 sleep、无随机性）：
+  - 客户表拷贝后、商品表拷贝前，单事务改客户名+商品价格 → 切片仍是旧名+旧价，
+    且写入在抽取结束前已提交；
+  - 闭包遍历后明细改指另一商品并删旧商品 → 抽取成功、切片保留旧引用、外键检查
+    通过，不误报失败
 - `test_recovery.py`：成功任务重启一致、中断任务重启置 failed、success 文件丢失降级
 - `test_web.py`：全部 HTTP API 与下载内容的外键检查
 - `test_bounded_memory.py`：4 万客户长环 + 万级明细，Python 峰值内存不随闭包增长

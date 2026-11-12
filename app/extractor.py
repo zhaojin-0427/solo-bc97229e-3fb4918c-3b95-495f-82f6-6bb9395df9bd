@@ -2,9 +2,20 @@
 
 算法要点
 ========
-1. 单连接快照
-   每个任务独占一个 ``mode=ro`` 只读连接，首个读语句即在 WAL 上固定读标记
-   （read mark）。此后源库的并发增删改对本连接不可见，整份切片来自同一快照。
+1. 单连接快照（全程一个读事务）
+   每个任务独占一个 ``mode=ro`` 只读连接。先建临时表，再显式 ``BEGIN``
+   并执行首条读语句，在 WAL 上固定读标记（read mark）；该读事务一直
+   保持到种子选取、闭包遍历、分批拷贝全部结束。源库的并发增删改对本
+   连接不可见，整份切片来自抽取开始时的同一快照；WAL 下读事务不阻塞
+   写入，源库写入可在抽取结束前正常提交。
+
+   关键陷阱（本缺陷的根因）：``Connection.executescript()`` 会先隐式
+   COMMIT 任何未决事务。若在 ``BEGIN`` 之后对快照连接调用它（旧代码
+   用它创建临时表），快照读标记会被立即释放，连接退回自动提交模式，
+   此后每条 SELECT 各自看到不同时刻的提交 —— 客户表拷贝于 T1、商品表
+   拷贝于 T2，拼出“旧客户名 + 新价格”的撕裂切片；遍历后源库合法改单
+   还会让拷贝读到新外键值，误报外键失败。因此本模块对快照连接只使用
+   ``execute``，并在拷贝前后断言读事务仍然打开。
 
 2. 临时表驱动的 BFS，进程内存有界
    遍历状态（frontier/seen/batch/cand）全部放在 SQLite 的*磁盘临时表*中
@@ -72,11 +83,14 @@ def run_extraction(
     batch_size: int = 500,
     progress: ProgressFn | None = None,
     on_snapshot: Callable[[], None] | None = None,
+    on_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> ExtractResult:
     """执行一次切片抽取。
 
     成功返回 ExtractResult；失败抛出异常并保证 output_path 不存在残件。
     on_snapshot 在快照读标记固定后回调（测试用于并发写入验证）。
+    on_event 在确定性时点回调（"traverse_done" / "before_copy_table" /
+    "after_copy_table"），回归测试用它精确控制并发写入的交错时序。
     """
     tmp_path = output_path.with_name(output_path.name + ".partial")
     if tmp_path.exists():
@@ -85,18 +99,26 @@ def run_extraction(
     snapshot = _open_snapshot(source_db)
     dest: sqlite3.Connection | None = None
     try:
+        # 临时表属于 temp 库，与主库快照无关，必须在 BEGIN 之前创建。
+        # 注意：绝不能在此后调用 executescript —— 它会隐式 COMMIT 未决
+        # 事务，释放 WAL 读标记，使后续每条 SELECT 看到不同时刻的提交。
+        _create_temp_tables(snapshot)
+
         snapshot.execute("BEGIN")
-        # 显式触发一次读，固定 WAL 读标记
+        # 显式触发一次读，固定 WAL 读标记；此后本连接看到的是同一快照
         snapshot.execute("SELECT count(*) FROM sqlite_master").fetchone()
         if on_snapshot is not None:
             on_snapshot()
 
-        _create_temp_tables(snapshot)
         _seed(snapshot, schema, return_order_id)
 
         def report(phase: str, **extra: Any) -> None:
             if progress is not None:
                 progress({"phase": phase, **extra})
+
+        def emit(event: str, **extra: Any) -> None:
+            if on_event is not None:
+                on_event(event, extra)
 
         report("traverse", message="正在递归遍历外键闭包")
         _traverse(snapshot, schema, batch_size, report)
@@ -115,14 +137,20 @@ def run_extraction(
             total_rows=total,
             message=f"闭包遍历完成，共选中 {total} 行",
         )
+        emit("traverse_done", row_counts=counts, total_rows=total)
+        # 防御：遍历结束后快照读事务必须仍然打开，否则宁可整次失败
+        _assert_snapshot_held(snapshot)
 
         dest = sqlite3.connect(str(tmp_path))
         # 加载阶段关闭外键检查：循环外键（客户推荐环）无法按线性顺序满足
         dest.execute("PRAGMA foreign_keys = OFF")
         _build_destination_ddl(dest, schema)
         copied = _stream_copy(
-            snapshot, dest, schema, batch_size, report
+            snapshot, dest, schema, batch_size, report, emit
         )
+        # 拷贝全部完成后，快照事务仍须保持 —— 中途被提交意味着切片
+        # 可能混入不同时刻的数据，必须失败而不是产出撕裂的切片
+        _assert_snapshot_held(snapshot)
 
         # 完整性闸门：全部通过才允许原子改名
         dest.execute("PRAGMA foreign_keys = ON")
@@ -183,32 +211,54 @@ def _open_snapshot(source_db: str) -> sqlite3.Connection:
     return conn
 
 
+def _assert_snapshot_held(conn: sqlite3.Connection) -> None:
+    """防御性检查：快照读事务必须全程保持打开。
+
+    任何意外的 COMMIT（例如对快照连接误用 executescript）都会释放 WAL
+    读标记，使后续读取看到更新的提交，拼出跨时刻的撕裂切片。一旦发现，
+    立即整次失败，绝不产出可疑切片。
+    """
+    if not conn.in_transaction:
+        raise ExtractionError(
+            "快照读事务被意外提交，抽取中止以避免混入不同时刻的数据"
+        )
+
+
 def _create_temp_tables(conn: sqlite3.Connection) -> None:
-    # WITHOUT ROWID 的复合主键表，去重与查找都走主键索引（落盘）
-    conn.executescript(
+    # WITHOUT ROWID 的复合主键表，去重与查找都走主键索引（落盘）。
+    # 刻意逐条 execute 而非 executescript：后者会隐式 COMMIT 未决事务，
+    # 在快照连接上绝不能出现这种副作用。
+    for ddl in (
         """
         CREATE TEMP TABLE seen (
             table_name TEXT NOT NULL,
             id         INTEGER NOT NULL,
             PRIMARY KEY (table_name, id)
-        ) WITHOUT ROWID;
+        ) WITHOUT ROWID
+        """,
+        """
         CREATE TEMP TABLE frontier (
             table_name TEXT NOT NULL,
             id         INTEGER NOT NULL,
             PRIMARY KEY (table_name, id)
-        ) WITHOUT ROWID;
+        ) WITHOUT ROWID
+        """,
+        """
         CREATE TEMP TABLE batch (
             table_name TEXT NOT NULL,
             id         INTEGER NOT NULL,
             PRIMARY KEY (table_name, id)
-        ) WITHOUT ROWID;
+        ) WITHOUT ROWID
+        """,
+        """
         CREATE TEMP TABLE cand (
             table_name TEXT NOT NULL,
             id         INTEGER NOT NULL,
             PRIMARY KEY (table_name, id)
-        ) WITHOUT ROWID;
-        """
-    )
+        ) WITHOUT ROWID
+        """,
+    ):
+        conn.execute(ddl)
 
 
 def _seed(
@@ -399,6 +449,7 @@ def _stream_copy(
     schema: DatabaseSchema,
     batch_size: int,
     report: ProgressFn,
+    emit: Callable[..., None],
 ) -> dict[str, int]:
     """按键集分页把 seen 集合中的行流式拷入切片，进程内存有界。"""
     copied_counts: dict[str, int] = {}
@@ -413,6 +464,7 @@ def _stream_copy(
         )
         id_index = ts.columns.index("id")
 
+        emit("before_copy_table", table=table)
         max_id = 0
         table_copied = 0
         while True:
@@ -443,4 +495,5 @@ def _stream_copy(
             if len(rows) < batch_size:
                 break
         copied_counts[table] = table_copied
+        emit("after_copy_table", table=table, table_rows=table_copied)
     return copied_counts
